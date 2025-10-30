@@ -1,84 +1,61 @@
-import crypto from 'crypto';
+// backend/src/tiktok.js
 import fetch from 'node-fetch';
 
-const {
-  TIKTOK_CLIENT_KEY,
-  TIKTOK_CLIENT_SECRET,
-  REDIRECT_URI
-} = process.env;
+const BASE = 'https://open.tiktokapis.com/v2';
+const AUTHZ = 'https://www.tiktok.com/v2/auth/authorize';
 
-// Passe SCOPES an, wenn nötig
-const SCOPES = "user.info.basic,user.info.profile";
-
-export function buildAuthUrl() {
-  const state = crypto.randomBytes(8).toString('hex');
-  const params = new URLSearchParams({
-    client_key: TIKTOK_CLIENT_KEY,
-    scope: SCOPES,
+export function buildAuthUrl({ clientKey, redirectUri, state }) {
+  const scopes = ['user.info.basic']; // nur basic!
+  const p = new URLSearchParams({
+    client_key: clientKey,
+    scope: scopes.join(','),
     response_type: 'code',
-    redirect_uri: REDIRECT_URI,
-    state
+    redirect_uri: redirectUri,
+    state,
   });
-  return `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
+  return `${AUTHZ}?${p.toString()}`;
 }
 
-export async function exchangeCodeForToken(code) {
-  // TikTok OAuth Token Endpoint (prüfe ggf. aktuelle Doku)
-  const url = "https://open.tiktokapis.com/v2/oauth/token/";
-  const body = {
-    client_key: TIKTOK_CLIENT_KEY,
-    client_secret: TIKTOK_CLIENT_SECRET,
+export async function exchangeCodeForToken({ clientKey, clientSecret, code, redirectUri }) {
+  const body = new URLSearchParams({
+    client_key: clientKey,
+    client_secret: clientSecret,
     code,
-    grant_type: "authorization_code",
-    redirect_uri: REDIRECT_URI
-  };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(body)
+    grant_type: 'authorization_code',
+    redirect_uri: redirectUri,
   });
+
+  const res = await fetch(`${BASE}/oauth/token/`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'Accept': 'application/json',
+    },
+    body,
+  });
+
+  const text = await res.text();
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error("Token-Exchange fehlgeschlagen: " + text);
+    throw new Error(`Token exchange failed ${res.status}: ${text}`);
   }
-  return res.json();
+  const json = JSON.parse(text);
+  if (!json.access_token) {
+    throw new Error(`Token exchange returned no access_token: ${text}`);
+  }
+  return json;
 }
 
-export async function refreshToken(refresh_token) {
-  const url = "https://open.tiktokapis.com/v2/oauth/token/";
-  const body = {
-    client_key: TIKTOK_CLIENT_KEY,
-    client_secret: TIKTOK_CLIENT_SECRET,
-    grant_type: "refresh_token",
-    refresh_token
-  };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(body)
+export async function getUserInfo(accessToken) {
+  const res = await fetch(`${BASE}/user/info/`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Accept': 'application/json',
+    },
   });
+  const text = await res.text();
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error("Refresh fehlgeschlagen: " + text);
+    throw new Error(`user/info failed ${res.status}: ${text}`);
   }
-  return res.json();
-}
-
-export async function getUserInfo(access_token) {
-  // Beispiel-Endpunkt — passe an deine benötigten Felder an
-  const url = "https://open.tiktokapis.com/v2/user/info/";
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${access_token}` }
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error("UserInfo fehlgeschlagen: " + text);
-  }
-  const data = await res.json();
-  // Map auf ein schlankes Objekt
-  return {
-    open_id: data?.data?.user?.open_id || null,
-    display_name: data?.data?.user?.display_name || "Creator",
-    avatar_url: data?.data?.user?.avatar_url || null
-  };
+  return JSON.parse(text);
 }
