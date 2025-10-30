@@ -7,69 +7,74 @@ import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import pino from 'pino';
 import pinoHttp from 'pino-http';
-import { buildAuthUrl, exchangeCodeForToken, refreshToken, getUserInfo } from './tiktok.js';
+
+import {
+  buildAuthUrl,
+  exchangeCodeForToken,
+  refreshToken,
+  getUserInfo,
+} from './tiktok.js';
 import { loadTokens, saveTokens } from './store.js';
 
+// ===== Config =====
 const {
   NODE_ENV = 'production',
   FRONTEND_ORIGIN = 'http://localhost:5173',
   REDIRECT_URI,
-  SESSION_SECRET = 'change-me'
+  SESSION_SECRET = 'change-me',
+  PORT = process.env.PORT || 3000,
 } = process.env;
 
 const logger = pino({ level: NODE_ENV === 'production' ? 'info' : 'debug' });
-
 const app = express();
-app.set('trust proxy', 1); // wichtig hinter Render/Proxies
+app.set('trust proxy', 1);
 
-// ---------- Security & Parsers ----------
+// Quick sanity log, helps bei Redirect-Fehlern
+logger.info({
+  FRONTEND_ORIGIN,
+  REDIRECT_URI,
+  NODE_ENV,
+}, 'Boot config');
+
+// ===== Middleware =====
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json());
 app.use(cookieParser(SESSION_SECRET));
 app.use(pinoHttp({ logger }));
+app.use(cors({
+  origin: [FRONTEND_ORIGIN],
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
-// ---------- CORS ----------
-app.use(
-  cors({
-    origin: [FRONTEND_ORIGIN],
-    credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
+// Rate Limits
+app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false }));
+app.use('/auth', rateLimit({ windowMs: 5 * 60 * 1000, max: 50 }));
 
-// ---------- Rate Limit (schützt /api & /auth) ----------
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use(['/api', '/auth'], limiter);
-
-// ---------- In-Memory Session + Persistenz ----------
+// ===== Session (im RAM) + Persistenz =====
 let SESSION = {
-  user: null,            // { open_id, display_name, avatar_url }
+  user: null,           // { open_id, display_name, avatar_url }
   access_token: null,
   refresh_token: null,
-  expires_at: 0,
+  expires_at: 0,        // ms epoch
 };
 
-// beim Start evtl. persistierte Tokens laden
+// Persistierte Tokens laden
 const persisted = loadTokens();
 if (persisted) {
   SESSION = { ...SESSION, ...persisted };
+  logger.info({ has_refresh: !!SESSION.refresh_token }, 'Loaded persisted tokens');
 }
 
-// ---------- Auto-Refresh ----------
+// ===== Auto-Refresh =====
 let refreshTimer = null;
 function scheduleRefresh() {
   if (refreshTimer) clearTimeout(refreshTimer);
-  if (!SESSION?.refresh_token || !SESSION?.expires_at) return;
+  if (!SESSION.refresh_token || !SESSION.expires_at) return;
 
   const msToExpiry = Math.max(0, SESSION.expires_at - Date.now());
-  // 10 Minuten vor Ablauf refreshen, min. 5 Minuten
-  const delay = Math.max(5 * 60 * 1000, msToExpiry - 10 * 60 * 1000);
+  const delay = Math.max(5 * 60 * 1000, msToExpiry - 10 * 60 * 1000); // 10 Min vorher, min 5 Min
 
   refreshTimer = setTimeout(async () => {
     try {
@@ -82,51 +87,74 @@ function scheduleRefresh() {
         logger.info('✅ Token automatisch erneuert');
         scheduleRefresh();
       } else {
-        logger.warn('⚠️ Refresh lieferte keinen access_token');
+        logger.warn({ next }, 'Refresh returned no access_token');
       }
     } catch (err) {
       logger.error({ err }, '❌ Token-Refresh fehlgeschlagen');
     }
   }, delay);
 }
-scheduleRefresh();
+if (SESSION.refresh_token && SESSION.expires_at) scheduleRefresh();
 
-// ---------- Health ----------
+// ===== Health / Debug =====
 app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/debug/session', (_req, res) => {
+  res.json({
+    has_user: !!SESSION.user,
+    has_access_token: !!SESSION.access_token,
+    has_refresh_token: !!SESSION.refresh_token,
+    expires_at: SESSION.expires_at,
+    now: Date.now(),
+  });
+});
 
-// ---------- TikTok Login ----------
+// ===== OAuth Start =====
 app.get('/auth/tiktok', (_req, res) => {
   try {
-    const url = buildAuthUrl();
+    if (!REDIRECT_URI) {
+      logger.error('REDIRECT_URI fehlt in Environment!');
+      return res.status(500).send('Serverfehler: REDIRECT_URI fehlt (Env).');
+    }
+    const url = buildAuthUrl(); // benutzt REDIRECT_URI aus Env
     return res.redirect(url);
-  } catch (err) {
-    logger.error({ err }, 'Fehler beim buildAuthUrl');
-    return res.status(500).json({ error: 'auth_init_failed' });
+  } catch (e) {
+    logger.error({ e }, 'buildAuthUrl failed');
+    return res.status(500).send('Auth init failed');
   }
 });
 
-// ---------- TikTok Callback ----------
+// ===== OAuth Callback =====
 app.get('/auth/tiktok/callback', async (req, res) => {
-  const { code, error } = req.query;
+  const { code, error, error_description } = req.query;
+
   if (error) {
-    logger.warn({ error }, 'TikTok Callback mit Fehler');
-    return res.status(400).send('Auth-Fehler: ' + error);
+    logger.error({ error, error_description }, 'TikTok returned error in callback');
+    return res
+      .status(400)
+      .send(`TikTok Fehler: ${error}${error_description ? ' - ' + error_description : ''}`);
   }
-  if (!code) return res.status(400).send('Auth-Fehler: code fehlt');
+  if (!code) {
+    logger.error('No "code" in TikTok callback');
+    return res.status(400).send('Fehler: Kein Code im Callback.');
+  }
 
   try {
-    const token = await exchangeCodeForToken(code, REDIRECT_URI);
+    const token = await exchangeCodeForToken(code);
+    if (!token?.access_token) {
+      logger.error({ token }, 'Token exchange returned no access_token');
+      return res.status(500).send('Interner Fehler beim Callback (kein Access Token).');
+    }
+
     SESSION.access_token = token.access_token;
     SESSION.refresh_token = token.refresh_token;
     SESSION.expires_at = Date.now() + (token.expires_in || 86400) * 1000;
 
     const me = await getUserInfo(SESSION.access_token);
-    SESSION.user = me;
+    SESSION.user = me || null;
 
     saveTokens(SESSION);
     scheduleRefresh();
 
-    // kleines Session-Flag
     res.cookie('tp_session', '1', {
       httpOnly: true,
       sameSite: 'lax',
@@ -135,43 +163,38 @@ app.get('/auth/tiktok/callback', async (req, res) => {
 
     // zurück ins Frontend
     return res.redirect(FRONTEND_ORIGIN);
-  } catch (err) {
-    logger.error({ err }, 'Callback-Fehler');
+  } catch (e) {
+    // Zeige Ursache im Log & eine klare Meldung im Browser
+    logger.error({ e }, 'Callback-Fehler (exchange/userinfo)');
     return res.status(500).send('Interner Fehler beim Callback');
   }
 });
 
-// ---------- Session/User ----------
-function userPayload() {
-  if (!SESSION?.access_token) return { error: 'No access_token saved' };
-  return { user: SESSION.user || null };
-}
-
-app.get('/me', (_req, res) => res.json(userPayload()));
-app.get('/api/me', (_req, res) => res.json(userPayload())); // Alias
-
-// ---------- Debug (optional) ----------
-app.get('/debug/session', (_req, res) => {
-  const { user, access_token, refresh_token, expires_at } = SESSION;
-  res.json({
-    user,
-    has_access_token: Boolean(access_token),
-    has_refresh_token: Boolean(refresh_token),
-    expires_at,
-  });
-});
-
+// ===== Logout =====
 app.post('/auth/logout', (_req, res) => {
   SESSION = { user: null, access_token: null, refresh_token: null, expires_at: 0 };
   saveTokens(SESSION);
-  if (refreshTimer) clearTimeout(refreshTimer);
   res.clearCookie('tp_session');
   return res.json({ ok: true });
 });
 
-// ---------- Start ----------
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, '0.0.0.0', () => {
+// ===== API =====
+app.get('/api/me', (_req, res) => {
+  if (!SESSION.access_token) return res.json({ error: 'No access_token saved' });
+  return res.json({ user: SESSION.user });
+});
+
+app.get('/api/trends', (_req, res) => {
+  const demo = [
+    { id: 't1', title: 'Cozy Morning Routine', hashtags: ['#cozy', '#morning', '#aesthetic'], score: 78 },
+    { id: 't2', title: 'POV Filter Mashup',   hashtags: ['#pov', '#filter', '#viral'],       score: 73 },
+    { id: 't3', title: 'Workout 12-min Hit',  hashtags: ['#fitness', '#12min', '#music'],    score: 69 },
+  ];
+  res.json({ trends: demo });
+});
+
+// ===== Start (Render-kompatibel) =====
+app.listen(Number(PORT), '0.0.0.0', () => {
   logger.info(`✅ API on :${PORT}`);
   logger.info(`   FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}`);
   logger.info(`   REDIRECT_URI   : ${REDIRECT_URI}`);
