@@ -8,7 +8,7 @@ const {
 } = process.env;
 
 // Passe SCOPES an, wenn nötig
-const SCOPES = "user.info.basic,user.info.profile";
+const SCOPES = "user.info.basic";
 
 export function buildAuthUrl() {
   const state = crypto.randomBytes(8).toString('hex');
